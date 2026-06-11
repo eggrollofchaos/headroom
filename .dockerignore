@@ -8,6 +8,8 @@
 
 # Python artifacts
 __pycache__
+.DS_Store
+__pycache__/
 *.pyc
 *.pyo
 *.egg-info
