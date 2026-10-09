@@ -4755,6 +4755,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     STATS_THROUGHPUT_TIMEOUT_SECONDS = 1.0
     _throughput_cache_lock = asyncio.Lock()
     _throughput_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
+    # Holds the one in-flight throughput scan, if any. The cache gate also
+    # fires on a null value, so without this a scan that timed out before ever
+    # producing a value would be restarted by every later /stats call while
+    # the first one is still running.
+    _throughput_scan: dict[str, Any] = {"task": None}
 
     RECENT_REQUEST_LOG_WINDOW = 100
 
@@ -4854,25 +4859,33 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     )
                     return build_perf_summary(perf_report).get("throughput")
 
+                scan = _throughput_scan["task"]
+                if scan is None:
+                    scan = asyncio.ensure_future(asyncio.to_thread(_compute_throughput))
+                    _throughput_scan["task"] = scan
+
                 try:
+                    # Shielded on purpose. A timeout here cannot stop the work:
+                    # the executor thread behind it is not cancellable, so
+                    # cancelling the scan would only lose its result. Keeping
+                    # the scan and re-awaiting it means a later /stats picks up
+                    # the same one instead of adding another thread to the
+                    # default executor.
                     throughput = await asyncio.wait_for(
-                        asyncio.to_thread(_compute_throughput),
+                        asyncio.shield(scan),
                         timeout=STATS_THROUGHPUT_TIMEOUT_SECONDS,
                     )
+                    _throughput_scan["task"] = None
                     _throughput_cache["value"] = throughput
                     _throughput_cache["expires_at"] = now + THROUGHPUT_CACHE_TTL_SECONDS
                 except TimeoutError:
-                    # The worker thread cannot be cancelled, so it keeps
-                    # grinding; advancing expires_at anyway means we do not
-                    # launch a fresh scan on every subsequent /stats call
-                    # while the previous one is still running. Whatever the
-                    # cache already holds (possibly None) is served.
-                    _throughput_cache["expires_at"] = now + THROUGHPUT_CACHE_TTL_SECONDS
                     logger.warning(
-                        "Timed out calculating throughput for stats after %.2fs",
+                        "Timed out calculating throughput for stats after %.2fs; "
+                        "the scan continues and a later /stats serves its result",
                         STATS_THROUGHPUT_TIMEOUT_SECONDS,
                     )
                 except Exception as e:
+                    _throughput_scan["task"] = None
                     logger.warning("Failed to calculate throughput for stats: %s", e, exc_info=True)
                     if _throughput_cache["value"] is None:
                         _throughput_cache["value"] = None

@@ -16,7 +16,7 @@ import logging
 import math
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -275,21 +275,48 @@ def _parse_log_ts(ts: str | None) -> datetime | None:
 
 
 @contextmanager
-def _open_log_tail(log_file: Path, max_tail_bytes: int | None) -> Iterator[io.TextIOWrapper]:
-    """Open ``log_file`` for line iteration, optionally only its last N bytes.
+def _open_log_tail(log_file: Path, max_tail_bytes: int | None) -> Iterator[Iterable[str]]:
+    """Yield log lines, optionally only those inside the last N bytes.
 
-    Opening in binary and wrapping the seeked handle is deliberate: a byte
-    offset is not a valid ``TextIOWrapper.seek`` cookie, so seeking has to
-    happen on the raw stream. With no cap this is equivalent to a plain
-    ``open(..., encoding="utf-8", errors="replace")``.
+    Without a cap this is a plain full-file text read.
+
+    With a cap, one bounded window is read, ending at the size observed on
+    entry. Reading the window up front rather than seeking and then streaming
+    to EOF is what keeps the promise the cap makes: a single log line can be
+    arbitrarily long (the proxy log carries untruncated wire previews), so a
+    seek followed by an unbounded ``readline`` can pull in far more than the
+    cap, and streaming to EOF would also keep following a file that is being
+    appended to while the report is built.
+
+    Seeking happens on the raw binary stream because a byte offset is not a
+    valid ``TextIOWrapper.seek`` cookie. One byte before the window is read
+    too, so an offset that already sits on a line start is distinguishable
+    from one that landed inside a line; only the latter discards a partial
+    record. Without that extra byte an aligned offset silently drops the
+    first complete record in the window.
     """
+    if not max_tail_bytes or max_tail_bytes <= 0:
+        with open(log_file, encoding="utf-8", errors="replace") as text:
+            yield text
+        return
+
     with open(log_file, "rb") as raw:
-        if max_tail_bytes and max_tail_bytes > 0:
-            size = log_file.stat().st_size
-            if size > max_tail_bytes:
-                raw.seek(size - max_tail_bytes)
-                raw.readline()  # Drop the partial line the seek landed inside.
-        yield io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+        size = log_file.stat().st_size
+        if size <= max_tail_bytes:
+            yield io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+            return
+        raw.seek(size - max_tail_bytes - 1)
+        window = raw.read(max_tail_bytes + 1)
+
+    if window[:1] == b"\n":
+        window = window[1:]
+    else:
+        _, newline, window = window.partition(b"\n")
+        if not newline:
+            # The window is one unterminated line, so it holds no complete
+            # record. Parsing its tail would invent a truncated one.
+            window = b""
+    yield io.StringIO(window.decode("utf-8", errors="replace"))
 
 
 def parse_log_files(
