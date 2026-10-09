@@ -253,3 +253,31 @@ def test_parse_log_files_aggregates_per_port_and_legacy(workspace: Path) -> None
     # Non-PERF files never ingested.
     assert models.isdisjoint({"model-STDIO", "model-STDIO2", "model-ERR"})
     assert rids.isdisjoint({"hr_stdio", "hr_stdio2", "hr_err"})
+
+
+def test_parse_log_files_tail_cap_reads_only_the_trailing_bytes(workspace: Path) -> None:
+    """``max_tail_bytes_per_file`` bounds the read; ``None`` still reads it all.
+
+    /stats calls ``parse_log_files`` on every (cache-expired) request, and on
+    a long-lived proxy the log is hundreds of MB. Without a cap the endpoint
+    pays for a full historical scan.
+    """
+    log_path = workspace / "logs" / "proxy-8787.log"
+    lines = [
+        _perf_line("2026-10-09 00:00:00,000", f"req-{i:05d}", "claude-opus-4-6") for i in range(400)
+    ]
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    total_bytes = log_path.stat().st_size
+    assert total_bytes > 4000, total_bytes
+
+    full = analyzer.parse_log_files(last_n_hours=0)
+    assert len(full.perf_records) == 400
+
+    capped = analyzer.parse_log_files(last_n_hours=0, max_tail_bytes_per_file=total_bytes // 4)
+    # Bounded: roughly the last quarter, and strictly fewer than everything.
+    assert 0 < len(capped.perf_records) < 400
+    # It is the TAIL, not the head: the final record must survive.
+    assert capped.perf_records[-1].request_id == "req-00399"
+    # The partial line the seek landed inside is discarded, not mis-parsed.
+    assert all(r.request_id.startswith("req-") for r in capped.perf_records)
+    assert capped.perf_records[0].request_id > "req-00000"

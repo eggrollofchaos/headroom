@@ -4747,6 +4747,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _stats_snapshot: dict[str, Any] = {"expires_at": 0.0, "value": None}
 
     THROUGHPUT_CACHE_TTL_SECONDS = 10.0
+    # The /stats throughput probe re-parses the proxy logs. On a long-lived
+    # proxy those are hundreds of MB, so cap the per-file tail it reads and
+    # put a wall-clock ceiling on the whole scan: /stats backs dashboard and
+    # health polling, where a current-ish number beats a complete one.
+    STATS_THROUGHPUT_LOG_TAIL_BYTES = 1_000_000
+    STATS_THROUGHPUT_TIMEOUT_SECONDS = 1.0
     _throughput_cache_lock = asyncio.Lock()
     _throughput_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
 
@@ -4842,13 +4848,30 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 def _compute_throughput():
                     from headroom.perf.analyzer import build_perf_summary, parse_log_files
 
-                    perf_report = parse_log_files(last_n_hours=1.0)
+                    perf_report = parse_log_files(
+                        last_n_hours=1.0,
+                        max_tail_bytes_per_file=STATS_THROUGHPUT_LOG_TAIL_BYTES,
+                    )
                     return build_perf_summary(perf_report).get("throughput")
 
                 try:
-                    throughput = await asyncio.to_thread(_compute_throughput)
+                    throughput = await asyncio.wait_for(
+                        asyncio.to_thread(_compute_throughput),
+                        timeout=STATS_THROUGHPUT_TIMEOUT_SECONDS,
+                    )
                     _throughput_cache["value"] = throughput
                     _throughput_cache["expires_at"] = now + THROUGHPUT_CACHE_TTL_SECONDS
+                except TimeoutError:
+                    # The worker thread cannot be cancelled, so it keeps
+                    # grinding; advancing expires_at anyway means we do not
+                    # launch a fresh scan on every subsequent /stats call
+                    # while the previous one is still running. Whatever the
+                    # cache already holds (possibly None) is served.
+                    _throughput_cache["expires_at"] = now + THROUGHPUT_CACHE_TTL_SECONDS
+                    logger.warning(
+                        "Timed out calculating throughput for stats after %.2fs",
+                        STATS_THROUGHPUT_TIMEOUT_SECONDS,
+                    )
                 except Exception as e:
                     logger.warning("Failed to calculate throughput for stats: %s", e, exc_info=True)
                     if _throughput_cache["value"] is None:

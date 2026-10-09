@@ -11,10 +11,13 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -271,7 +274,29 @@ def _parse_log_ts(ts: str | None) -> datetime | None:
         return None
 
 
-def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
+@contextmanager
+def _open_log_tail(log_file: Path, max_tail_bytes: int | None) -> Iterator[io.TextIOWrapper]:
+    """Open ``log_file`` for line iteration, optionally only its last N bytes.
+
+    Opening in binary and wrapping the seeked handle is deliberate: a byte
+    offset is not a valid ``TextIOWrapper.seek`` cookie, so seeking has to
+    happen on the raw stream. With no cap this is equivalent to a plain
+    ``open(..., encoding="utf-8", errors="replace")``.
+    """
+    with open(log_file, "rb") as raw:
+        if max_tail_bytes and max_tail_bytes > 0:
+            size = log_file.stat().st_size
+            if size > max_tail_bytes:
+                raw.seek(size - max_tail_bytes)
+                raw.readline()  # Drop the partial line the seek landed inside.
+        yield io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+
+
+def parse_log_files(
+    last_n_hours: float = 168.0,
+    *,
+    max_tail_bytes_per_file: int | None = None,
+) -> PerfReport:
     """Parse all proxy log files and return structured records.
 
     Args:
@@ -280,6 +305,12 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             window in the report header reflects the actual timestamps that
             survived the filter, so the user can see whether the log went
             back far enough.
+        max_tail_bytes_per_file: Optional per-file cap on how many trailing
+            bytes are read. ``None`` (the default, used by the CLI reports)
+            reads every file in full. Callers that need a bounded latency
+            more than a complete history — the live dashboard /stats
+            throughput probe — pass a cap so one multi-hundred-megabyte
+            proxy log cannot stall the request.
 
     Returns:
         PerfReport with all parsed records.
@@ -361,7 +392,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     for log_file in log_files:
         report.log_files_read += 1
         try:
-            with open(log_file, encoding="utf-8", errors="replace") as f:
+            with _open_log_tail(log_file, max_tail_bytes_per_file) as f:
                 for line in f:
                     report.total_lines_parsed += 1
                     line = line.rstrip()
